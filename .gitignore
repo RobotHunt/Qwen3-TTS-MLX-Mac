@@ -1,3 +1,4 @@
 *.log
 expect
-__pycache__/fastapi_server.cpython-314.pyc
+__pycache__/
+.venv/
