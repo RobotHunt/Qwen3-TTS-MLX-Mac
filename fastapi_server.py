@@ -30,8 +30,8 @@ import uvicorn
 # ──────────────────────────────────────────
 # 配置区：根据你的硬件修改
 # ──────────────────────────────────────────
-MODELS_DIR = os.path.expanduser("~/Downloads/Qwen3-TTS-Models")
-OUTPUT_DIR = os.path.expanduser("~/Downloads/Qwen3-TTS-MLX-Mac/output")
+MODELS_DIR = os.path.expanduser("~/Qwen3-TTS-Models")
+OUTPUT_DIR = "/tmp/qwen3-tts-output"
 MAX_WORKERS = 1   # 单 worker 进程，保证同时只加载一个模型
 MAX_QUEUE = 16    # 最大并发排队数，超出返回 429
 

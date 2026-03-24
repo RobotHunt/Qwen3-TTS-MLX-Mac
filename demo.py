@@ -13,8 +13,8 @@ except ImportError:
     print("❌ 请先安装依赖: pip install mlx mlx-audio soundfile")
     sys.exit(1)
 
-# 默认模型路径（本地下载目录）
-MODELS_DIR = os.path.expanduser("~/Downloads/Qwen3-TTS-Models")
+# 默认模型路径（用户主目录）
+MODELS_DIR = os.path.expanduser("~/Qwen3-TTS-Models")
 MODEL_MAP = {
     "base":        f"{MODELS_DIR}/Base-8bit",
     "voicedesign": f"{MODELS_DIR}/VoiceDesign-8bit",
