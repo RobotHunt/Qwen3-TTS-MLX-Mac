@@ -1,6 +1,6 @@
 """
-Qwen3-TTS FastAPI + ProcessPool 生产级服务端
-专为 Apple Silicon (M1/M2/M3/M4) 设计
+TTS FastAPI + ProcessPool 生产级服务端
+本地语音合成服务
 
 Features:
   - CORS 跨域支持
@@ -39,7 +39,7 @@ MAX_QUEUE = 16    # 最大并发排队数，超出返回 429
 CLEANUP_INTERVAL_SEC = 300    # 每 5 分钟扫描一次
 CLEANUP_MAX_AGE_SEC = 600     # 文件超过 10 分钟即删除
 
-# 默认流式采样率（与 Qwen3-TTS 模型一致）
+# 默认流式采样率
 DEFAULT_SAMPLE_RATE = 24000
 
 # ──────────────────────────────────────────
@@ -82,29 +82,29 @@ MODEL_MAP = {v["internal_type"]: v["path"] for v in MODEL_REGISTRY.values()}
 CUSTOM_SPEAKERS = ["serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan"]
 
 # ──────────────────────────────────────────
-# 声音注册表（含 OpenAI 标准名 + Qwen3 原生名）
+# 声音注册表（含 OpenAI 标准名 + 原生名）
 # ──────────────────────────────────────────
 VOICE_REGISTRY = [
-    {"openai_name": "alloy",   "qwen3_name": "vivian",   "gender": "female", "language": "en/zh"},
-    {"openai_name": "echo",    "qwen3_name": "ryan",     "gender": "male",   "language": "en"},
-    {"openai_name": "fable",   "qwen3_name": "serena",   "gender": "female", "language": "en"},
-    {"openai_name": "nova",    "qwen3_name": "ono_anna", "gender": "female", "language": "ja/en"},
-    {"openai_name": "onyx",    "qwen3_name": "eric",     "gender": "male",   "language": "en"},
-    {"openai_name": "shimmer", "qwen3_name": "sohee",    "gender": "female", "language": "ko/en"},
-    {"openai_name": "ash",     "qwen3_name": "aiden",    "gender": "male",   "language": "en"},
-    {"openai_name": "coral",   "qwen3_name": "dylan",    "gender": "male",   "language": "en"},
-    {"openai_name": "sage",    "qwen3_name": "uncle_fu", "gender": "male",   "language": "zh/en"},
+    {"openai_name": "alloy",   "native_name": "vivian",   "gender": "female", "language": "en/zh"},
+    {"openai_name": "echo",    "native_name": "ryan",     "gender": "male",   "language": "en"},
+    {"openai_name": "fable",   "native_name": "serena",   "gender": "female", "language": "en"},
+    {"openai_name": "nova",    "native_name": "ono_anna", "gender": "female", "language": "ja/en"},
+    {"openai_name": "onyx",    "native_name": "eric",     "gender": "male",   "language": "en"},
+    {"openai_name": "shimmer", "native_name": "sohee",    "gender": "female", "language": "ko/en"},
+    {"openai_name": "ash",     "native_name": "aiden",    "gender": "male",   "language": "en"},
+    {"openai_name": "coral",   "native_name": "dylan",    "gender": "male",   "language": "en"},
+    {"openai_name": "sage",    "native_name": "uncle_fu", "gender": "male",   "language": "zh/en"},
 ]
 
-# 双向映射：OpenAI 名 <-> Qwen3 名均可作为输入
+# 双向映射：OpenAI 名 <-> 原生名均可作为输入
 _VOICE_LOOKUP = {}
 for _v in VOICE_REGISTRY:
-    _VOICE_LOOKUP[_v["openai_name"]] = _v["qwen3_name"]
-    _VOICE_LOOKUP[_v["qwen3_name"]] = _v["qwen3_name"]  # 原生名直接通过
+    _VOICE_LOOKUP[_v["openai_name"]] = _v["native_name"]
+    _VOICE_LOOKUP[_v["native_name"]] = _v["native_name"]  # 原生名直接通过
 
 
 def resolve_voice(voice_input: str) -> str:
-    """将 OpenAI 标准名或 Qwen3 原生名统一解析为 Qwen3 speaker 名"""
+    """将 OpenAI 标准名或原生名统一解析为 speaker 名"""
     return _VOICE_LOOKUP.get(voice_input, voice_input)
 
 # ──────────────────────────────────────────
@@ -129,7 +129,7 @@ async def lifespan(app: FastAPI):
     _start_time = time.time()
     _tts_semaphore = asyncio.Semaphore(MAX_QUEUE)
     _cleanup_task = asyncio.get_event_loop().create_task(_cleanup_loop())
-    print(f"🚀 Qwen3-TTS Server Started | Workers: {MAX_WORKERS} | Models: {MODELS_DIR}")
+    print(f"🚀 TTS Server Started | Workers: {MAX_WORKERS}")
     yield
     if _cleanup_task:
         _cleanup_task.cancel()
@@ -143,9 +143,9 @@ async def lifespan(app: FastAPI):
 # FastAPI 应用
 # ──────────────────────────────────────────
 app = FastAPI(
-    title="Qwen3-TTS Apple Silicon API",
+    title="TTS API",
     version="3.0",
-    description="OpenAI-compatible local TTS service for Apple Silicon",
+    description="OpenAI-compatible local TTS service",
     lifespan=lifespan,
 )
 
@@ -419,7 +419,7 @@ select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='ht
 <body>
 <div class="container">
 <h1>🔊 TTS Playground</h1>
-<p class="sub">Apple Silicon · 本地离线 · OpenAI API 兼容</p>
+<p class="sub">本地离线 · OpenAI API 兼容</p>
 
 <div class="tabs">
   <button class="tab active" onclick="switchTab('cv')">🎤 预设说话人</button>
@@ -436,15 +436,15 @@ select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='ht
   <div class="field">
     <label>选择说话人</label>
     <select id="cv-voice">
-      <option value="alloy">alloy → vivian (女, 中英)</option>
-      <option value="echo">echo → ryan (男, 英)</option>
-      <option value="fable">fable → serena (女, 英)</option>
-      <option value="nova">nova → ono_anna (女, 日/英)</option>
-      <option value="onyx">onyx → eric (男, 英)</option>
-      <option value="shimmer">shimmer → sohee (女, 韩/英)</option>
-      <option value="ash">ash → aiden (男, 英)</option>
-      <option value="coral">coral → dylan (男, 英)</option>
-      <option value="sage">sage → uncle_fu (男, 中英)</option>
+      <option value="alloy">alloy (女, 中英)</option>
+      <option value="echo">echo (男, 英)</option>
+      <option value="fable">fable (女, 英)</option>
+      <option value="nova">nova (女, 日/英)</option>
+      <option value="onyx">onyx (男, 英)</option>
+      <option value="shimmer">shimmer (女, 韩/英)</option>
+      <option value="ash">ash (男, 英)</option>
+      <option value="coral">coral (男, 英)</option>
+      <option value="sage">sage (男, 中英)</option>
     </select>
   </div>
   <button class="btn" id="cv-btn" onclick="genCustomVoice()">生成语音</button>
@@ -698,12 +698,11 @@ async def get_openai_models():
                 "id": model_id,
                 "object": "model",
                 "created": now,
-                "owned_by": "qwen3-tts",
+                "owned_by": "local",
                 "description": info["description"],
                 "capabilities": info["capabilities"],
                 "required_params": info["required_params"],
                 "optional_params": info.get("optional_params", []),
-                "local_dir": info["local_dir"],
             })
     return {"object": "list", "data": data}
 
@@ -713,15 +712,13 @@ async def get_openai_models():
 async def get_openai_voices():
     """
     列出所有可用声音。
-    每个声音包含 OpenAI 标准名、Qwen3 原生名、性别、支持语言。
-    两种名称均可在 /v1/audio/speech 的 voice 字段中直接使用。
+    每个声音包含标准名、性别、支持语言。
     """
     voices = []
     for v in VOICE_REGISTRY:
         voices.append({
             "voice_id": v["openai_name"],
             "name": v["openai_name"],
-            "qwen3_name": v["qwen3_name"],
             "gender": v["gender"],
             "language": v["language"],
             "preview_url": None,
@@ -735,27 +732,18 @@ async def openai_audio_speech(
     request: OpenAITTSRequest = Body(
         ...,
         openapi_examples={
-            "CustomVoice - 预设说话人": {
-                "summary": "使用预设说话人（alloy→vivian）",
-                "description": "qwen3-tts-customvoice：9 种内置说话人，voice 可用 OpenAI 标准名（alloy/echo/fable/nova/onyx/shimmer/ash/coral/sage）或 Qwen3 原生名（vivian/ryan/serena 等）",
+            "预设说话人": {
+                "summary": "使用预设说话人",
+                "description": "9 种内置说话人，voice 可用标准名（alloy/echo/fable/nova/onyx/shimmer/ash/coral/sage）",
                 "value": {
                     "model": "qwen3-tts-customvoice",
-                    "input": "你好，我是 Vivian，这是预设说话人模式。Welcome to Qwen3 TTS!",
+                    "input": "你好，这是预设说话人模式。Welcome to TTS!",
                     "voice": "alloy",
                 },
             },
-            "CustomVoice - Qwen3原生名": {
-                "summary": "直接使用 Qwen3 原生说话人名",
-                "description": "voice 字段也可以直接填 Qwen3 原生名，如 uncle_fu、sohee、ono_anna 等",
-                "value": {
-                    "model": "qwen3-tts-customvoice",
-                    "input": "大家好，我是傅叔叔。这是使用 Qwen3 原生说话人名的效果。",
-                    "voice": "uncle_fu",
-                },
-            },
-            "VoiceDesign - 自定义音色": {
+            "自定义音色": {
                 "summary": "通过自然语言描述设计任意音色",
-                "description": "qwen3-tts-voicedesign：用 instructions 字段描述你想要的声音特征，模型会据此生成。对齐 OpenAI gpt-4o-mini-tts 的 instructions 字段。",
+                "description": "用 instructions 字段描述你想要的声音特征，模型会据此生成",
                 "value": {
                     "model": "qwen3-tts-voicedesign",
                     "input": "Welcome to the world of AI voice synthesis. You can design any voice simply by describing it.",
@@ -763,7 +751,7 @@ async def openai_audio_speech(
                     "instructions": "A deep, warm, authoritative male voice with a slight British accent, speaking at a measured and elegant pace.",
                 },
             },
-            "VoiceDesign - 中文女主播": {
+            "中文女主播": {
                 "summary": "设计一个活力中文女主播音色",
                 "description": "instructions 支持英文描述，模型会根据描述生成对应音色",
                 "value": {
@@ -773,9 +761,9 @@ async def openai_audio_speech(
                     "instructions": "A cheerful, energetic young Chinese female radio host voice, speaking with warmth and enthusiasm.",
                 },
             },
-            "Base - 零样本语音克隆": {
+            "零样本语音克隆": {
                 "summary": "提供参考音频进行声音克隆",
-                "description": "qwen3-tts-base：提供 ref_audio（参考音频文件路径）和可选的 ref_text（参考音频对应文本），模型会克隆该声音。",
+                "description": "提供 ref_audio（参考音频文件路径）和可选的 ref_text（参考音频对应文本），模型会克隆该声音。",
                 "value": {
                     "model": "qwen3-tts-base",
                     "input": "This is a zero-shot voice cloning demo. The output voice will match the reference audio.",
@@ -798,21 +786,10 @@ async def openai_audio_speech(
     | `qwen3-tts-voicedesign` | 自然语言设计音色 | `instructions` |
     | `qwen3-tts-base` | 零样本语音克隆 | `ref_audio` |
 
-    ## Voice 双向映射
+    ## Voice 可用值
 
-    `voice` 字段同时支持 OpenAI 标准名和 Qwen3 原生名：
-
-    | OpenAI | Qwen3 | 性别 | 语言 |
-    |--------|-------|------|------|
-    | alloy | vivian | 女 | en/zh |
-    | echo | ryan | 男 | en |
-    | fable | serena | 女 | en |
-    | nova | ono_anna | 女 | ja/en |
-    | onyx | eric | 男 | en |
-    | shimmer | sohee | 女 | ko/en |
-    | ash | aiden | 男 | en |
-    | coral | dylan | 男 | en |
-    | sage | uncle_fu | 男 | zh/en |
+    `voice` 字段支持以下标准名：
+    alloy / echo / fable / nova / onyx / shimmer / ash / coral / sage
 
     > ⚠️ 同一时刻只加载一个模型，切换模型时自动卸载旧模型防止 OOM。
     """
@@ -858,7 +835,7 @@ async def openai_audio_speech(
         if not request.instructions:
             raise HTTPException(
                 status_code=422,
-                detail="qwen3-tts-voicedesign 需要提供 'instructions' 参数来描述期望的音色，"
+                detail="VoiceDesign 模型需要提供 'instructions' 参数来描述期望的音色，"
                        "例如: 'A warm, mature male voice with a calm and professional tone.'"
             )
         internal_req["instruct"] = request.instructions
@@ -867,7 +844,7 @@ async def openai_audio_speech(
         if not request.ref_audio:
             raise HTTPException(
                 status_code=422,
-                detail="qwen3-tts-base 需要提供 'ref_audio' 参数（参考音频文件路径）用于零样本语音克隆，"
+                detail="Base 模型需要提供 'ref_audio' 参数（参考音频文件路径）用于零样本语音克隆，"
                        "同时建议提供 'ref_text'（参考音频对应文本）"
             )
         internal_req["ref_audio"] = request.ref_audio
@@ -930,7 +907,7 @@ async def openai_audio_speech_clone(
     零样本语音克隆（支持上传音频文件）。
 
     上传一段参考音频，模型会克隆该声音来朗读你指定的文本。
-    使用 `qwen3-tts-base` 模型。
+    使用 Base 模型。
 
     - **file**: 参考音频文件（直接上传，支持 wav/mp3/flac 等）
     - **input**: 要用克隆声音朗读的文本
@@ -943,7 +920,7 @@ async def openai_audio_speech_clone(
     # 校验 Base 模型可用
     base_info = MODEL_REGISTRY.get("qwen3-tts-base")
     if not base_info or not os.path.isdir(base_info["path"]):
-        raise HTTPException(status_code=400, detail="qwen3-tts-base 模型不可用，请先下载 Base-8bit 模型")
+        raise HTTPException(status_code=400, detail="Base 模型不可用，请先确保模型已下载")
 
     # 保存上传文件到临时目录
     suffix = os.path.splitext(file.filename or "upload.wav")[1] or ".wav"
