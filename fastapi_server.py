@@ -20,8 +20,8 @@ from contextlib import asynccontextmanager
 multiprocessing.set_start_method("spawn", force=True)
 
 from concurrent.futures import ProcessPoolExecutor
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse, Response
+from fastapi import FastAPI, HTTPException, Body, UploadFile, File, Form
+from fastapi.responses import StreamingResponse, Response, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
@@ -155,76 +155,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-class TTSRequest(BaseModel):
-    text: str
-    model_type: str = "VoiceDesign"  # Base / VoiceDesign / CustomVoice
-    instruct: Optional[str] = "A young female with a friendly, professional tone."
-    voice: Optional[str] = None      # CustomVoice 说话人名
-    ref_audio: Optional[str] = None  # Base 模型零样本克隆用
-    ref_text: Optional[str] = None
-
-
 class OpenAITTSRequest(BaseModel):
-    """严格对标 OpenAI /v1/audio/speech 请求格式"""
-    model: str                        # qwen3-tts-base / qwen3-tts-voicedesign / qwen3-tts-customvoice
-    input: str                        # 要合成的文本
-    voice: str = "alloy"              # OpenAI 标准名或 Qwen3 原生 speaker 名（双向均可）
-    response_format: str = "wav"      # wav / pcm / mp3 / opus / aac / flac
-    speed: float = 1.0                # 语速（保留字段）
-    # 对齐 OpenAI gpt-4o-mini-tts 的 instructions 字段，用于 qwen3-tts-voicedesign
-    instructions: Optional[str] = None
-    # qwen3-tts-base 零样本克隆专用
-    ref_audio: Optional[str] = None
+    """对标 OpenAI /v1/audio/speech 请求格式"""
+    model: str = "qwen3-tts-customvoice"  # 默认使用预设说话人模型
+    input: str                             # 要合成的文本
+    voice: str = "alloy"                   # OpenAI 标准名或 Qwen3 原生 speaker 名
+    response_format: str = "wav"           # wav / pcm
+    speed: float = 1.0                     # 语速（保留字段）
+    instructions: Optional[str] = None     # 用于 qwen3-tts-voicedesign
+    ref_audio: Optional[str] = None        # 用于 qwen3-tts-base
     ref_text: Optional[str] = None
-
-
-# ──────────────────────────────────────────
-# Worker 函数（子进程中执行）
-# ──────────────────────────────────────────
-def _generate_audio_task(task_id: str, request_data: dict, output_dir: str):
-    """
-    子进程 worker：延迟导入 MLX 确保独立的 Metal GPU 上下文
-    """
-    try:
-        from mlx_audio.tts.generate import generate_audio
-    except ImportError as e:
-        return False, str(e)
-
-    model_type = request_data.get("model_type", "VoiceDesign")
-    model_path = MODEL_MAP.get(model_type, MODEL_MAP["VoiceDesign"])
-
-    if not os.path.isdir(model_path):
-        return False, f"模型目录不存在: {model_path}，请先运行 setup.sh"
-
-    kwargs = {
-        "text": request_data["text"],
-        "model": model_path,
-        "output_path": output_dir,
-        "file_prefix": task_id,
-        "audio_format": "wav",
-        "stream": False,
-        "play": False,
-    }
-
-    # 根据模型类型设置对应参数
-    if model_type == "VoiceDesign":
-        kwargs["instruct"] = request_data.get("instruct")
-    elif model_type == "CustomVoice":
-        voice = request_data.get("voice", "vivian")
-        if voice not in CUSTOM_SPEAKERS:
-            return False, f"不支持的说话人 '{voice}'，可用: {CUSTOM_SPEAKERS}"
-        kwargs["voice"] = voice
-    elif model_type == "Base":
-        if request_data.get("ref_audio"):
-            kwargs["ref_audio"] = request_data["ref_audio"]
-            kwargs["ref_text"] = request_data.get("ref_text", "")
-
-    try:
-        generate_audio(**kwargs)
-        return True, f"{output_dir}/{task_id}_000.wav"
-    except Exception as e:
-        return False, str(e)
 
 
 def _stream_audio_task(request_data: dict, queue: multiprocessing.Queue):
@@ -292,7 +232,12 @@ def _stream_audio_task(request_data: dict, queue: multiprocessing.Queue):
                     request_data["ref_audio"],
                     sample_rate=model.sample_rate,
                 )
-                gen_kwargs["ref_text"] = request_data.get("ref_text", "")
+                # ref_text 必须是参考音频的准确转录文本
+                # 模型会将 ref_text + text 拼接为连续语音
+                # 如果 ref_text 不准确会导致输出混乱
+                ref_text = request_data.get("ref_text", "").strip()
+                if ref_text:
+                    gen_kwargs["ref_text"] = ref_text
 
         results = model.generate(**gen_kwargs)
 
@@ -405,94 +350,334 @@ async def health_check():
     return {
         "status": "ok",
         "uptime_seconds": round(time.time() - _start_time, 1) if _start_time else 0,
-        "models": {k: os.path.isdir(v) for k, v in MODEL_MAP.items()},
+        "models": {mid: os.path.isdir(info["path"]) for mid, info in MODEL_REGISTRY.items()},
         "workers": MAX_WORKERS,
     }
 
 
-# ─── 完整生成（原有端点） ───
-@app.post("/generate")
-async def generate_tts(request: TTSRequest):
-    """合成语音并返回完整音频文件"""
-    import uuid
-    task_id = f"tts_{uuid.uuid4().hex[:8]}"
-    loop = asyncio.get_running_loop()
+# ─── Web UI ───
+@app.get("/", response_class=HTMLResponse)
+async def web_ui():
+    """浏览器端 TTS 试听界面"""
+    return """<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TTS Playground</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter',-apple-system,system-ui,sans-serif;background:#0f0f1a;color:#e0e0f0;min-height:100vh;display:flex;justify-content:center;padding:30px 16px}
+.container{max-width:720px;width:100%}
+h1{font-size:1.8rem;text-align:center;margin-bottom:6px;background:linear-gradient(135deg,#7c3aed,#2563eb,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.sub{text-align:center;color:#888;font-size:.85rem;margin-bottom:28px}
+.tabs{display:flex;gap:6px;margin-bottom:20px}
+.tab{flex:1;padding:10px 0;border:none;border-radius:10px;cursor:pointer;font-size:.85rem;font-weight:600;background:#1a1a2e;color:#888;transition:all .2s}
+.tab.active{background:linear-gradient(135deg,#7c3aed,#2563eb);color:#fff;box-shadow:0 4px 20px rgba(99,60,255,.3)}
+.tab:hover:not(.active){background:#252540;color:#bbb}
+.card{background:#1a1a2e;border-radius:14px;padding:24px;border:1px solid #2a2a45}
+label{display:block;font-size:.8rem;color:#999;margin-bottom:6px;font-weight:500}
+textarea,input[type=text],select{width:100%;padding:10px 14px;border-radius:8px;border:1px solid #333;background:#12121f;color:#e0e0f0;font-size:.9rem;outline:none;transition:border .2s}
+textarea:focus,input:focus,select:focus{border-color:#7c3aed}
+textarea{resize:vertical;min-height:80px;font-family:inherit}
+select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M6 8L1 3h10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center}
+.row{display:flex;gap:12px;margin-bottom:14px}
+.row>div{flex:1}
+.field{margin-bottom:14px}
+.btn{width:100%;padding:12px;border:none;border-radius:10px;font-size:.95rem;font-weight:600;cursor:pointer;background:linear-gradient(135deg,#7c3aed,#2563eb);color:#fff;transition:all .25s;margin-top:6px}
+.btn:hover{transform:translateY(-1px);box-shadow:0 6px 24px rgba(99,60,255,.4)}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
+.btn:disabled::after{content:'  ⏳'}
+.result{margin-top:18px;display:none}
+.result.show{display:block}
+.result audio{width:100%;margin-top:8px;border-radius:8px}
+.result .time{font-size:.75rem;color:#666;margin-top:4px;text-align:right}
+.info{font-size:.75rem;color:#555;margin-top:6px;line-height:1.5}
+.upload-area{border:2px dashed #333;border-radius:10px;padding:20px;text-align:center;cursor:pointer;transition:all .2s;position:relative}
+.upload-area:hover{border-color:#7c3aed;background:#1f1f35}
+.upload-area input{position:absolute;inset:0;opacity:0;cursor:pointer}
+.upload-area .icon{font-size:2rem;margin-bottom:6px}
+.upload-area .name{color:#7c3aed;font-size:.85rem;margin-top:4px}
+.hidden{display:none}
+.audio-source{display:flex;gap:10px;margin-bottom:10px}
+.audio-source .src-btn{flex:1;padding:8px;border:none;border-radius:8px;cursor:pointer;font-size:.8rem;font-weight:600;background:#252540;color:#888;transition:all .2s}
+.audio-source .src-btn.active{background:#2a2a55;color:#7c3aed;border:1px solid #7c3aed}
+.rec-area{text-align:center;padding:24px}
+.rec-btn{width:64px;height:64px;border-radius:50%;border:3px solid #444;background:#1a1a2e;cursor:pointer;display:flex;align-items:center;justify-content:center;margin:0 auto 10px;transition:all .2s}
+.rec-btn .dot{width:24px;height:24px;border-radius:50%;background:#ef4444;transition:all .2s}
+.rec-btn.recording{border-color:#ef4444;animation:pulse 1.5s infinite}
+.rec-btn.recording .dot{border-radius:4px;width:18px;height:18px}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,.4)}50%{box-shadow:0 0 0 12px rgba(239,68,68,0)}}
+.rec-timer{font-size:.85rem;color:#999;font-variant-numeric:tabular-nums}
+.rec-preview{margin-top:10px}
+.rec-preview audio{width:100%}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🔊 TTS Playground</h1>
+<p class="sub">Apple Silicon · 本地离线 · OpenAI API 兼容</p>
 
-    try:
-        success, result = await loop.run_in_executor(
-            tts_pool, _generate_audio_task, task_id, request.dict(), OUTPUT_DIR
-        )
-        if success:
-            return FileResponse(result, media_type="audio/wav", filename=f"{task_id}.wav")
-        else:
-            raise HTTPException(status_code=500, detail=result)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('cv')">🎤 预设说话人</button>
+  <button class="tab" onclick="switchTab('vd')">🎨 设计音色</button>
+  <button class="tab" onclick="switchTab('base')">🧬 语音克隆</button>
+</div>
 
+<!-- CustomVoice -->
+<div class="card" id="panel-cv">
+  <div class="field">
+    <label>要合成的文本</label>
+    <textarea id="cv-text">大家好，Welcome to the TTS playground! 这是一个中英文混合语音合成的示例，you can try different voices here.</textarea>
+  </div>
+  <div class="field">
+    <label>选择说话人</label>
+    <select id="cv-voice">
+      <option value="alloy">alloy → vivian (女, 中英)</option>
+      <option value="echo">echo → ryan (男, 英)</option>
+      <option value="fable">fable → serena (女, 英)</option>
+      <option value="nova">nova → ono_anna (女, 日/英)</option>
+      <option value="onyx">onyx → eric (男, 英)</option>
+      <option value="shimmer">shimmer → sohee (女, 韩/英)</option>
+      <option value="ash">ash → aiden (男, 英)</option>
+      <option value="coral">coral → dylan (男, 英)</option>
+      <option value="sage">sage → uncle_fu (男, 中英)</option>
+    </select>
+  </div>
+  <button class="btn" id="cv-btn" onclick="genCustomVoice()">生成语音</button>
+  <div class="result" id="cv-result">
+    <label>🎧 合成结果</label>
+    <audio id="cv-audio" controls></audio>
+    <div class="time" id="cv-time"></div>
+  </div>
+</div>
 
-# ─── 流式生成（新端点） ───
-@app.post("/stream")
-async def stream_tts(request: TTSRequest):
-    """流式合成语音，逐段返回 WAV 音频流（降低首字延迟）"""
-    q = _mp_manager.Queue()
-    loop = asyncio.get_running_loop()
+<!-- VoiceDesign -->
+<div class="card hidden" id="panel-vd">
+  <div class="field">
+    <label>要合成的文本</label>
+    <textarea id="vd-text">欢迎来到 AI 语音合成的世界。You can design any voice simply by describing it in natural language. 让我们开始吧！</textarea>
+  </div>
+  <div class="field">
+    <label>音色描述 (instructions)</label>
+    <textarea id="vd-inst" style="min-height:60px">A deep, warm, authoritative male voice with a slight British accent, speaking at a measured and elegant pace.</textarea>
+  </div>
+  <button class="btn" id="vd-btn" onclick="genVoiceDesign()">生成语音</button>
+  <div class="result" id="vd-result">
+    <label>🎧 合成结果</label>
+    <audio id="vd-audio" controls></audio>
+    <div class="time" id="vd-time"></div>
+  </div>
+</div>
 
-    # 在进程池中启动流式生成（fire-and-forget）
-    loop.run_in_executor(tts_pool, _stream_audio_task, request.dict(), q)
+<!-- Base (Clone) -->
+<div class="card hidden" id="panel-base">
+  <div class="field">
+    <label>要合成的文本</label>
+    <textarea id="base-text">This is a zero-shot voice cloning demo. The output voice will match the reference audio you uploaded.</textarea>
+  </div>
+  <div class="field">
+    <label>参考音频</label>
+    <div class="audio-source">
+      <button class="src-btn active" onclick="switchSrc('upload')">📁 上传文件</button>
+      <button class="src-btn" onclick="switchSrc('record')">🎙️ 录音</button>
+    </div>
+    <div id="src-upload">
+      <div class="upload-area" id="upload-area">
+        <input type="file" id="base-file" accept="audio/*" onchange="onFileSelect(this)">
+        <div class="icon">📁</div>
+        <div>点击或拖拽上传参考音频 (wav/mp3/flac)</div>
+        <div class="name" id="file-name"></div>
+      </div>
+    </div>
+    <div id="src-record" class="hidden">
+      <div class="rec-area">
+        <button class="rec-btn" id="rec-btn" onclick="toggleRecord()">
+          <div class="dot"></div>
+        </button>
+        <div class="rec-timer" id="rec-timer">点击开始录音</div>
+        <div class="rec-preview hidden" id="rec-preview">
+          <audio id="rec-audio" controls></audio>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="field">
+    <label>参考音频的准确转录文本（必须与音频内容完全一致，否则留空）</label>
+    <input type="text" id="base-ref-text" placeholder="输入参考音频中说话人所说的原文，不确定就留空...">
+  </div>
+  <button class="btn" id="base-btn" onclick="genClone()">生成语音</button>
+  <div class="result" id="base-result">
+    <label>🎧 克隆结果</label>
+    <audio id="base-audio" controls></audio>
+    <div class="time" id="base-time"></div>
+  </div>
+</div>
 
-    async def audio_chunk_generator():
-        sample_rate = DEFAULT_SAMPLE_RATE
-        header_sent = False
+<p class="info" style="margin-top:16px;text-align:center">⚠️ 同一时刻只加载一个模型，首次或切换模型需约 10s 加载时间&nbsp;&nbsp;|&nbsp;&nbsp;<a href="/docs" style="color:#7c3aed">API 文档</a></p>
+</div>
 
-        while True:
-            # 非阻塞轮询 Queue
-            item = await loop.run_in_executor(None, q.get)
+<script>
+function switchTab(id) {
+  document.querySelectorAll('.tab').forEach((t,i) => {
+    const panels = ['cv','vd','base'];
+    t.classList.toggle('active', panels[i]===id);
+  });
+  ['cv','vd','base'].forEach(p => {
+    document.getElementById('panel-'+p).classList.toggle('hidden', p!==id);
+  });
+}
 
-            # 处理错误
-            if isinstance(item, Exception):
-                raise HTTPException(status_code=500, detail=str(item))
+function onFileSelect(input) {
+  const name = input.files[0]?.name || '';
+  document.getElementById('file-name').textContent = name ? '✅ ' + name : '';
+}
 
-            # 哨兵：结束
-            if item is None:
-                break
+async function doGenerate(btn, audioEl, timeEl, resultEl, fetchFn) {
+  btn.disabled = true;
+  const btnText = btn.textContent.replace('  ⏳','');
+  resultEl.classList.remove('show');
+  const t0 = Date.now();
+  try {
+    const blob = await fetchFn();
+    const url = URL.createObjectURL(blob);
+    audioEl.src = url;
+    audioEl.load();
+    resultEl.classList.add('show');
+    timeEl.textContent = '耗时 ' + ((Date.now()-t0)/1000).toFixed(1) + 's';
+  } catch(e) {
+    alert('生成失败: ' + (e.message || e));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = btnText;
+  }
+}
 
-            tag, data = item
+function genCustomVoice() {
+  doGenerate(
+    document.getElementById('cv-btn'),
+    document.getElementById('cv-audio'),
+    document.getElementById('cv-time'),
+    document.getElementById('cv-result'),
+    async () => {
+      const r = await fetch('/v1/audio/speech', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({model:'qwen3-tts-customvoice', input:document.getElementById('cv-text').value, voice:document.getElementById('cv-voice').value})
+      });
+      if(!r.ok) throw new Error((await r.json()).detail);
+      return r.blob();
+    }
+  );
+}
 
-            # 采样率元信息
-            if tag == "sample_rate":
-                sample_rate = data
-                continue
+function genVoiceDesign() {
+  doGenerate(
+    document.getElementById('vd-btn'),
+    document.getElementById('vd-audio'),
+    document.getElementById('vd-time'),
+    document.getElementById('vd-result'),
+    async () => {
+      const r = await fetch('/v1/audio/speech', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({model:'qwen3-tts-voicedesign', input:document.getElementById('vd-text').value, voice:'alloy', instructions:document.getElementById('vd-inst').value})
+      });
+      if(!r.ok) throw new Error((await r.json()).detail);
+      return r.blob();
+    }
+  );
+}
 
-            # 音频 chunk
-            if tag == "audio":
-                if not header_sent:
-                    yield _make_wav_header(sample_rate=sample_rate)
-                    header_sent = True
-                yield data
+function genClone() {
+  const file = document.getElementById('base-file').files[0] || recordedBlob;
+  if(!file){alert('请先上传或录制参考音频');return}
+  doGenerate(
+    document.getElementById('base-btn'),
+    document.getElementById('base-audio'),
+    document.getElementById('base-time'),
+    document.getElementById('base-result'),
+    async () => {
+      const fd = new FormData();
+      fd.append('file', file, file.name || 'recording.wav');
+      fd.append('input', document.getElementById('base-text').value);
+      fd.append('ref_text', document.getElementById('base-ref-text').value);
+      const r = await fetch('/v1/audio/speech/clone', {method:'POST', body:fd});
+      if(!r.ok) throw new Error((await r.json()).detail);
+      return r.blob();
+    }
+  );
+}
 
-    return StreamingResponse(audio_chunk_generator(), media_type="audio/wav")
+// ── 录音相关 ──
+let mediaRecorder = null;
+let recordedChunks = [];
+let recordedBlob = null;
+let recStartTime = 0;
+let recTimer = null;
 
+function switchSrc(mode) {
+  document.querySelectorAll('.src-btn').forEach((b,i) => b.classList.toggle('active', (i===0&&mode==='upload')||(i===1&&mode==='record')));
+  document.getElementById('src-upload').classList.toggle('hidden', mode!=='upload');
+  document.getElementById('src-record').classList.toggle('hidden', mode!=='record');
+}
 
-# ─── 说话人列表 ───
-@app.get("/speakers")
-async def list_speakers():
-    """列出 CustomVoice 可用说话人"""
-    return {"speakers": CUSTOM_SPEAKERS}
+async function toggleRecord() {
+  const btn = document.getElementById('rec-btn');
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+    btn.classList.remove('recording');
+    clearInterval(recTimer);
+    document.getElementById('rec-timer').textContent = '录音完成';
+    return;
+  }
+  // 兼容性检查
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    // 尝试旧版 API
+    const legacyGetUserMedia = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+    if (!legacyGetUserMedia) {
+      alert('当前浏览器不支持录音功能。\\n请使用 Chrome/Edge/Safari 并通过 localhost 或 127.0.0.1 访问，或改用 HTTPS。');
+      return;
+    }
+    // 包装旧版 API 为 Promise
+    navigator.mediaDevices = navigator.mediaDevices || {};
+    navigator.mediaDevices.getUserMedia = (constraints) => new Promise((resolve, reject) => legacyGetUserMedia.call(navigator, constraints, resolve, reject));
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    recordedChunks = [];
+    // 选择浏览器支持的格式
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : (MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : '');
+    mediaRecorder = mimeType ? new MediaRecorder(stream, {mimeType}) : new MediaRecorder(stream);
+    const ext = mimeType.includes('mp4') ? '.m4a' : '.webm';
+    mediaRecorder.ondataavailable = e => { if(e.data.size>0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach(t=>t.stop());
+      recordedBlob = new Blob(recordedChunks, {type: mediaRecorder.mimeType});
+      recordedBlob.name = 'recording' + ext;
+      const url = URL.createObjectURL(recordedBlob);
+      const preview = document.getElementById('rec-preview');
+      document.getElementById('rec-audio').src = url;
+      preview.classList.remove('hidden');
+      document.getElementById('base-file').value = '';
+      document.getElementById('file-name').textContent = '';
+    };
+    mediaRecorder.start();
+    btn.classList.add('recording');
+    recStartTime = Date.now();
+    updateRecTimer();
+    recTimer = setInterval(updateRecTimer, 100);
+  } catch(e) {
+    alert('无法访问麦克风: ' + e.message + '\\n\\n提示: 请确保通过 localhost 或 127.0.0.1 访问本页面。');
+  }
+}
 
+function updateRecTimer() {
+  const s = ((Date.now()-recStartTime)/1000).toFixed(1);
+  document.getElementById('rec-timer').textContent = '🔴 录音中 ' + s + 's';
+}
+</script>
+</body>
+</html>"""
 
-# ─── 模型列表 ───
-@app.get("/models")
-async def list_models():
-    """列出已安装的模型"""
-    available = {k: os.path.isdir(v) for k, v in MODEL_MAP.items()}
-    return {"models": available}
-
-
-# ──────────────────────────────────────────
-# OpenAI 兼容端点
-# ──────────────────────────────────────────
 
 # ─── GET /v1/models ───
 @app.get("/v1/models")
@@ -543,16 +728,90 @@ async def get_openai_voices():
 
 # ─── POST /v1/audio/speech ───
 @app.post("/v1/audio/speech")
-async def openai_audio_speech(request: OpenAITTSRequest):
+async def openai_audio_speech(
+    request: OpenAITTSRequest = Body(
+        ...,
+        openapi_examples={
+            "CustomVoice - 预设说话人": {
+                "summary": "使用预设说话人（alloy→vivian）",
+                "description": "qwen3-tts-customvoice：9 种内置说话人，voice 可用 OpenAI 标准名（alloy/echo/fable/nova/onyx/shimmer/ash/coral/sage）或 Qwen3 原生名（vivian/ryan/serena 等）",
+                "value": {
+                    "model": "qwen3-tts-customvoice",
+                    "input": "你好，我是 Vivian，这是预设说话人模式。Welcome to Qwen3 TTS!",
+                    "voice": "alloy",
+                },
+            },
+            "CustomVoice - Qwen3原生名": {
+                "summary": "直接使用 Qwen3 原生说话人名",
+                "description": "voice 字段也可以直接填 Qwen3 原生名，如 uncle_fu、sohee、ono_anna 等",
+                "value": {
+                    "model": "qwen3-tts-customvoice",
+                    "input": "大家好，我是傅叔叔。这是使用 Qwen3 原生说话人名的效果。",
+                    "voice": "uncle_fu",
+                },
+            },
+            "VoiceDesign - 自定义音色": {
+                "summary": "通过自然语言描述设计任意音色",
+                "description": "qwen3-tts-voicedesign：用 instructions 字段描述你想要的声音特征，模型会据此生成。对齐 OpenAI gpt-4o-mini-tts 的 instructions 字段。",
+                "value": {
+                    "model": "qwen3-tts-voicedesign",
+                    "input": "Welcome to the world of AI voice synthesis. You can design any voice simply by describing it.",
+                    "voice": "alloy",
+                    "instructions": "A deep, warm, authoritative male voice with a slight British accent, speaking at a measured and elegant pace.",
+                },
+            },
+            "VoiceDesign - 中文女主播": {
+                "summary": "设计一个活力中文女主播音色",
+                "description": "instructions 支持英文描述，模型会根据描述生成对应音色",
+                "value": {
+                    "model": "qwen3-tts-voicedesign",
+                    "input": "亲爱的听众朋友们，欢迎收听今天的节目！今天我们来聊聊人工智能语音合成技术。",
+                    "voice": "alloy",
+                    "instructions": "A cheerful, energetic young Chinese female radio host voice, speaking with warmth and enthusiasm.",
+                },
+            },
+            "Base - 零样本语音克隆": {
+                "summary": "提供参考音频进行声音克隆",
+                "description": "qwen3-tts-base：提供 ref_audio（参考音频文件路径）和可选的 ref_text（参考音频对应文本），模型会克隆该声音。",
+                "value": {
+                    "model": "qwen3-tts-base",
+                    "input": "This is a zero-shot voice cloning demo. The output voice will match the reference audio.",
+                    "voice": "alloy",
+                    "ref_audio": "/path/to/reference_audio.wav",
+                    "ref_text": "The transcript of the reference audio goes here.",
+                },
+            },
+        },
+    )
+):
     """
-    兼容 OpenAI `POST /v1/audio/speech` 接口，流式传输音频。
+    OpenAI 兼容语音合成接口。
 
-    模型 ID：
-      - qwen3-tts-customvoice : 需要 voice（预设说话人）
-      - qwen3-tts-voicedesign : 需要 instructions（自然语言音色描述）
-      - qwen3-tts-base        : 需要 ref_audio（+ 可选 ref_text，零样本克隆）
+    ## 三种模型
 
-    voice 字段支持 OpenAI 标准名（alloy/echo/...）和 Qwen3 原生名（vivian/ryan/...），双向均可。
+    | 模型 ID | 用途 | 必填参数 |
+    |---------|------|----------|
+    | `qwen3-tts-customvoice` | 9 种预设说话人 | `voice` |
+    | `qwen3-tts-voicedesign` | 自然语言设计音色 | `instructions` |
+    | `qwen3-tts-base` | 零样本语音克隆 | `ref_audio` |
+
+    ## Voice 双向映射
+
+    `voice` 字段同时支持 OpenAI 标准名和 Qwen3 原生名：
+
+    | OpenAI | Qwen3 | 性别 | 语言 |
+    |--------|-------|------|------|
+    | alloy | vivian | 女 | en/zh |
+    | echo | ryan | 男 | en |
+    | fable | serena | 女 | en |
+    | nova | ono_anna | 女 | ja/en |
+    | onyx | eric | 男 | en |
+    | shimmer | sohee | 女 | ko/en |
+    | ash | aiden | 男 | en |
+    | coral | dylan | 男 | en |
+    | sage | uncle_fu | 男 | zh/en |
+
+    > ⚠️ 同一时刻只加载一个模型，切换模型时自动卸载旧模型防止 OOM。
     """
 
     # ── 1. 解析模型 ──
@@ -609,7 +868,8 @@ async def openai_audio_speech(request: OpenAITTSRequest):
                        "同时建议提供 'ref_text'（参考音频对应文本）"
             )
         internal_req["ref_audio"] = request.ref_audio
-        internal_req["ref_text"] = request.ref_text or ""
+        if request.ref_text and request.ref_text.strip():
+            internal_req["ref_text"] = request.ref_text.strip()
 
     # ── 4. 生成音频并收集全部 PCM 数据 ──
     q = _mp_manager.Queue()
@@ -646,6 +906,107 @@ async def openai_audio_speech(request: OpenAITTSRequest):
         media_type="audio/wav",
         headers={"Content-Disposition": "attachment; filename=speech.wav"},
     )
+
+
+# ─── POST /v1/audio/speech/clone ───
+@app.post("/v1/audio/speech/clone")
+async def openai_audio_speech_clone(
+    file: UploadFile = File(..., description="参考音频文件（支持 wav/mp3/flac 等格式）"),
+    input: str = Form(..., description="要合成的文本"),
+    ref_text: str = Form("", description="参考音频的准确转录文本（必须与音频内容完全一致，否则留空）"),
+    response_format: str = Form("wav", description="输出格式：wav / pcm"),
+):
+    """
+    零样本语音克隆（支持上传音频文件）。
+
+    上传一段参考音频，模型会克隆该声音来朗读你指定的文本。
+    使用 `qwen3-tts-base` 模型。
+
+    - **file**: 参考音频文件（直接上传，支持 wav/mp3/flac 等）
+    - **input**: 要用克隆声音朗读的文本
+    - **ref_text**: 参考音频对应的文本（可选，提供可提高克隆效果）
+    - **response_format**: 输出格式，默认 wav
+    """
+    import uuid
+    import tempfile
+
+    # 校验 Base 模型可用
+    base_info = MODEL_REGISTRY.get("qwen3-tts-base")
+    if not base_info or not os.path.isdir(base_info["path"]):
+        raise HTTPException(status_code=400, detail="qwen3-tts-base 模型不可用，请先下载 Base-8bit 模型")
+
+    # 保存上传文件到临时目录
+    suffix = os.path.splitext(file.filename or "upload.wav")[1] or ".wav"
+    tmp_path = os.path.join(tempfile.gettempdir(), f"tts_ref_{uuid.uuid4().hex[:8]}{suffix}")
+    wav_path = None  # 用于记录转换后的 WAV 路径
+    try:
+        content = await file.read()
+        with open(tmp_path, "wb") as f:
+            f.write(content)
+
+        # 非 WAV 格式需要通过 ffmpeg 转换（浏览器录音通常是 WebM）
+        audio_path = tmp_path
+        if suffix.lower() not in (".wav", ".flac", ".ogg"):
+            import subprocess
+            wav_path = tmp_path.rsplit(".", 1)[0] + ".wav"
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", tmp_path, "-ar", "24000", "-ac", "1", "-f", "wav", wav_path],
+                capture_output=True, timeout=30,
+            )
+            if result.returncode != 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"音频格式转换失败（{suffix}），请上传 WAV/MP3/FLAC 格式：{result.stderr.decode()[:200]}"
+                )
+            audio_path = wav_path
+
+        # 构建内部请求
+        internal_req = {
+            "text": input,
+            "model_type": "Base",
+            "ref_audio": audio_path,
+        }
+        if ref_text and ref_text.strip():
+            internal_req["ref_text"] = ref_text.strip()
+
+        # 生成音频
+        q = _mp_manager.Queue()
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(tts_pool, _stream_audio_task, internal_req, q)
+
+        audio_chunks = []
+        sample_rate = DEFAULT_SAMPLE_RATE
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if isinstance(item, Exception):
+                raise HTTPException(status_code=500, detail=str(item))
+            if item is None:
+                break
+            tag, data = item
+            if tag == "sample_rate":
+                sample_rate = data
+            elif tag == "audio":
+                audio_chunks.append(data)
+
+        if not audio_chunks:
+            raise HTTPException(status_code=500, detail="音频生成失败：未产生任何音频数据")
+
+        pcm_data = b"".join(audio_chunks)
+
+        if response_format == "pcm":
+            return Response(content=pcm_data, media_type="audio/pcm")
+
+        wav_data = _make_complete_wav(pcm_data, sample_rate=sample_rate)
+        return Response(
+            content=wav_data,
+            media_type="audio/wav",
+            headers={"Content-Disposition": "attachment; filename=cloned_speech.wav"},
+        )
+    finally:
+        # 清理临时文件
+        for p in [tmp_path, wav_path]:
+            if p and os.path.exists(p):
+                os.remove(p)
 
 
 if __name__ == "__main__":
