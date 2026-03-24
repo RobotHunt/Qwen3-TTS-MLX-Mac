@@ -32,7 +32,8 @@ import uvicorn
 # ──────────────────────────────────────────
 MODELS_DIR = os.path.expanduser("~/Downloads/Qwen3-TTS-Models")
 OUTPUT_DIR = os.path.expanduser("~/Downloads/Qwen3-TTS-MLX-Mac/output")
-MAX_WORKERS = 1  # 同时只加载一个模型，防止 OOM
+MAX_WORKERS = 1   # 单 worker 进程，保证同时只加载一个模型
+MAX_QUEUE = 16    # 最大并发排队数，超出返回 429
 
 # 临时文件清理配置
 CLEANUP_INTERVAL_SEC = 300    # 每 5 分钟扫描一次
@@ -113,6 +114,7 @@ tts_pool = None
 _start_time = None
 _cleanup_task = None
 _mp_manager = None
+_tts_semaphore = None  # asyncio.Semaphore, 限制并发排队数
 
 
 # ──────────────────────────────────────────
@@ -120,11 +122,12 @@ _mp_manager = None
 # ──────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tts_pool, _start_time, _cleanup_task, _mp_manager
+    global tts_pool, _start_time, _cleanup_task, _mp_manager, _tts_semaphore
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     tts_pool = ProcessPoolExecutor(max_workers=MAX_WORKERS)
     _mp_manager = multiprocessing.Manager()
     _start_time = time.time()
+    _tts_semaphore = asyncio.Semaphore(MAX_QUEUE)
     _cleanup_task = asyncio.get_event_loop().create_task(_cleanup_loop())
     print(f"🚀 Qwen3-TTS Server Started | Workers: {MAX_WORKERS} | Models: {MODELS_DIR}")
     yield
@@ -872,29 +875,36 @@ async def openai_audio_speech(
             internal_req["ref_text"] = request.ref_text.strip()
 
     # ── 4. 生成音频并收集全部 PCM 数据 ──
-    q = _mp_manager.Queue()
-    loop = asyncio.get_running_loop()
-    loop.run_in_executor(tts_pool, _stream_audio_task, internal_req, q)
+    # MAX_WORKERS=1 保证单 worker，模型缓存机制保证同时只加载一个模型
+    # Semaphore 限制最多 MAX_QUEUE 个请求同时排队
+    if not _tts_semaphore.locked() or _tts_semaphore._value > 0:
+        pass  # 有空位
+    else:
+        raise HTTPException(status_code=429, detail=f"服务繁忙，当前已有 {MAX_QUEUE} 个请求排队，请稍后重试")
+    async with _tts_semaphore:
+        q = _mp_manager.Queue()
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(tts_pool, _stream_audio_task, internal_req, q)
 
-    # 收集所有 PCM 数据块，构建完整 WAV（非流式，确保可播放）
-    audio_chunks = []
-    sample_rate = DEFAULT_SAMPLE_RATE
-    while True:
-        item = await loop.run_in_executor(None, q.get)
-        if isinstance(item, Exception):
-            raise HTTPException(status_code=500, detail=str(item))
-        if item is None:
-            break
-        tag, data = item
-        if tag == "sample_rate":
-            sample_rate = data
-        elif tag == "audio":
-            audio_chunks.append(data)
+        # 收集所有 PCM 数据块，构建完整 WAV（非流式，确保可播放）
+        audio_chunks = []
+        sample_rate = DEFAULT_SAMPLE_RATE
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if isinstance(item, Exception):
+                raise HTTPException(status_code=500, detail=str(item))
+            if item is None:
+                break
+            tag, data = item
+            if tag == "sample_rate":
+                sample_rate = data
+            elif tag == "audio":
+                audio_chunks.append(data)
 
-    if not audio_chunks:
-        raise HTTPException(status_code=500, detail="音频生成失败：未产生任何音频数据")
+        if not audio_chunks:
+            raise HTTPException(status_code=500, detail="音频生成失败：未产生任何音频数据")
 
-    pcm_data = b"".join(audio_chunks)
+        pcm_data = b"".join(audio_chunks)
 
     # ── 5. 构建响应 ──
     if request.response_format == "pcm":
@@ -969,29 +979,30 @@ async def openai_audio_speech_clone(
         if ref_text and ref_text.strip():
             internal_req["ref_text"] = ref_text.strip()
 
-        # 生成音频
-        q = _mp_manager.Queue()
-        loop = asyncio.get_running_loop()
-        loop.run_in_executor(tts_pool, _stream_audio_task, internal_req, q)
+        # 生成音频（Semaphore 限制最多 MAX_QUEUE 路并发排队）
+        async with _tts_semaphore:
+            q = _mp_manager.Queue()
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(tts_pool, _stream_audio_task, internal_req, q)
 
-        audio_chunks = []
-        sample_rate = DEFAULT_SAMPLE_RATE
-        while True:
-            item = await loop.run_in_executor(None, q.get)
-            if isinstance(item, Exception):
-                raise HTTPException(status_code=500, detail=str(item))
-            if item is None:
-                break
-            tag, data = item
-            if tag == "sample_rate":
-                sample_rate = data
-            elif tag == "audio":
-                audio_chunks.append(data)
+            audio_chunks = []
+            sample_rate = DEFAULT_SAMPLE_RATE
+            while True:
+                item = await loop.run_in_executor(None, q.get)
+                if isinstance(item, Exception):
+                    raise HTTPException(status_code=500, detail=str(item))
+                if item is None:
+                    break
+                tag, data = item
+                if tag == "sample_rate":
+                    sample_rate = data
+                elif tag == "audio":
+                    audio_chunks.append(data)
 
-        if not audio_chunks:
-            raise HTTPException(status_code=500, detail="音频生成失败：未产生任何音频数据")
+            if not audio_chunks:
+                raise HTTPException(status_code=500, detail="音频生成失败：未产生任何音频数据")
 
-        pcm_data = b"".join(audio_chunks)
+            pcm_data = b"".join(audio_chunks)
 
         if response_format == "pcm":
             return Response(content=pcm_data, media_type="audio/pcm")
